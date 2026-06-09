@@ -788,7 +788,7 @@ class JMComicPlugin(MaiBotPlugin):
         await self.ctx.send.text(self._help_text(), stream_id)
         return True, "未知 JM 指令，已发送帮助", True
 
-    @Command("jm_random", description="随机本子，用法: 随机本子", pattern=r"^随机本子")
+    @Command("jm_random", description="随机本子，用法: 随机本子 或 /随机本子", pattern=r"^/?随机本子")
     async def handle_jm_random_command(self, stream_id: str = "", **kwargs):
         self.ctx.logger.info("[JMComicPlugin] 随机本子 命令被调用: stream_id=%s", stream_id)
         if not self.config.plugin.enabled:
