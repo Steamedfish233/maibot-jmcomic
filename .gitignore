@@ -1,0 +1,13 @@
+# 用户配置文件不纳入版本控制
+config.toml
+
+# 运行时数据和临时文件
+data/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 系统文件
+.DS_Store
+Thumbs.db

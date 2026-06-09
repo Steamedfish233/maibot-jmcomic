@@ -1,0 +1,23 @@
+{
+  "plugin_name": "JMComic 助手",
+  "plugin_description": "基于 jmcomic 的 JM 下载、验车和搜索插件",
+
+  "tool.jm_download_pdf.name": "JM下载 PDF",
+  "tool.jm_download_pdf.description": "下载指定 JM 作品并转换为 PDF 发送给用户",
+  "tool.jm_download_pdf.param.album_id": "JM 作品 ID",
+
+  "tool.jm_preview_forward.name": "JM验车",
+  "tool.jm_preview_forward.description": "发送指定 JM 作品前几张图片的 QQ 合并转发消息",
+  "tool.jm_preview_forward.param.album_id": "JM 作品 ID",
+
+  "tool.jm_search.name": "JM搜索",
+  "tool.jm_search.description": "按关键词搜索 JM 作品并返回标题和车牌号",
+  "tool.jm_search.param.keyword": "搜索关键词",
+
+  "command.jm_download.name": "JM下载命令",
+  "command.jm_download.description": "通过 /JM下载 命令下载并发送 PDF",
+  "command.jm_preview.name": "JM验车命令",
+  "command.jm_preview.description": "通过 JM验车 命令发送合并转发预览",
+  "command.jm_search.name": "JM搜索命令",
+  "command.jm_search.description": "通过 JM搜索 命令搜索作品"
+}

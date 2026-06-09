@@ -1,0 +1,54 @@
+{
+  "manifest_version": 2,
+  "id": "local.maibot-jmcomic",
+  "version": "1.0.0",
+  "name": "JMComic 助手",
+  "description": "基于 jmcomic 的 MaiBot 第三方插件，支持 JM下载加密 PDF 发送、JM验车合并转发、JM搜索、随机本子。",
+  "author": {
+    "name": "local",
+    "url": "https://github.com/hect0x7/JMComic-Crawler-Python"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/hect0x7/JMComic-Crawler-Python",
+    "homepage": "https://docs.mai-mai.org/develop/plugin-dev/",
+    "documentation": "https://docs.mai-mai.org/develop/plugin-dev/"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "jmcomic",
+      "version_spec": ">=2.5.0"
+    },
+    {
+      "type": "python_package",
+      "name": "pillow",
+      "version_spec": ">=10.0.0"
+    },
+    {
+      "type": "python_package",
+      "name": "pypdf",
+      "version_spec": ">=4.0.0"
+    }
+  ],
+  "capabilities": [
+    "send.text",
+    "send.image",
+    "config.get",
+    "config.get_plugin",
+    "api.call"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "locales_path": "_locales",
+    "supported_locales": ["zh-CN"]
+  }
+}

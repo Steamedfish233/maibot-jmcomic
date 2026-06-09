@@ -1,0 +1,43 @@
+[plugin]
+# 是否启用插件。关闭后命令和工具会返回未启用提示。
+enabled = true
+# 配置结构版本号，用于后续配置迁移，请勿随意修改。
+config_version = "1.0.0"
+
+[jm]
+# JMComic option.yml 路径。
+# 留空时插件会自动生成临时 option 文件，只用于下载到 data/temp。
+# 如果你的网络环境需要代理、cookies 或自定义域名，请填写自定义 option.yml 的绝对路径。
+option_file = ""
+
+# 临时工作目录。
+# 插件会临时下载图片、生成 PDF、准备验车图，发送完成后默认自动清理。
+temp_dir = "data/temp"
+
+# JM搜索最多返回数量。
+max_search_results = 5
+
+# JM验车发送前几张图片，默认 5 张。
+preview_image_count = 5
+
+[send]
+# 下载/验车前是否发送“正在处理”的提示。
+notice_before_download = true
+
+# PDF 图片质量，范围 1-95。数值越高，文件越大。
+pdf_quality = 90
+
+# 是否自动撤回处理提示、完成提示和错误提示。
+recall_notice_messages = true
+
+# 提示消息自动撤回延迟秒数。设置为 0 表示不撤回。
+recall_after_seconds = 60
+
+[privacy]
+# 用户白名单。填写允许使用 JMComic 插件的用户 QQ 号。
+# 私聊必须命中此白名单；群聊中也会校验发起命令的用户 QQ。
+allowed_users = []
+
+# 群聊白名单。填写允许使用 JMComic 插件的群号。
+# 群聊调用时必须同时满足：群号在 allowed_groups，用户 QQ 在 allowed_users。
+allowed_groups = []
