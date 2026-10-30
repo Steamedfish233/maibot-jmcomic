@@ -17,7 +17,9 @@
 | **自动撤回** | 处理提示、完成提示和错误提示可按配置自动撤回，默认开启 |
 | **AI 智能调用** | 用户自然语言表达“下载 JM”“验车”“搜索车号”“随机本子”等意图时，可由 MaiBot 调用工具 |
 | **热重载配置** | 修改 `config.toml` 后通过 MaiBot 插件配置更新机制调用 `on_config_update`，无需重启主程序 |
-| **临时文件清理** | 插件只临时下载、转换和发送；发送流程结束后自动删除临时图片与 PDF |
+| **并发上限** | `[jm].max_concurrent_jobs` 限制同时执行的下载/验车任务数量；超过上限时立即回复“当前任务较多”，不无限堆积 |
+| **流式 PDF 构建** | 逐页编码后再合并，峰值内存不随总页数增长，大体积作品不会把内存吃满 |
+| **临时文件清理** | 插件只临时下载、转换和发送；发送流程结束后自动删除临时图片与 PDF，启动/热重载时还会清理上次异常退出残留的 `JM*` 任务目录与 PDF（进行中任务的目录会被保留） |
 
 ---
 
@@ -30,13 +32,39 @@
     │   └── maibot-jmcomic/
     │       ├── _manifest.json
     │       ├── plugin.py
-    │       ├── config.toml
-    │       ├── config.example.toml
+    │       ├── config.example.toml   # 随插件发布
+    │       ├── config.toml           # 由 Runner 首次加载时从配置模型生成，.gitignore 忽略
     │       ├── .gitignore
     │       ├── README.md
     │       └── _locales/
     │           └── zh-CN.json
     └── ...
+
+### ⚠️ MaiBot OneKey 用户请先看这里：装错目录永远不会生效
+
+**OneKey（桌面一键包）的实际运行目录不在安装目录里，而在用户数据目录中。** 插件必须放进：
+
+    %APPDATA%\MaiBotOneKeyDesktop\<实例ID>\modules\MaiBot\plugins\
+
+展开后类似：
+
+    C:\Users\<你的用户名>\AppData\Roaming\MaiBotOneKeyDesktop\0f4edb67bb15\modules\MaiBot\plugins\maibot-jmcomic-main\
+
+**放这里是无效的**（很多人会误放）：
+
+    D:\maibot\MaiBot OneKey\resources\modules\MaiBot\plugins\    ← 安装目录，只是资源副本
+
+把插件放进安装目录的 `resources\modules\...` 下，MaiBot 启动时**根本不会扫描到它**，插件列表里也不会出现，你会以为插件坏了，其实只是放错了地方。
+
+**怎么找到正确的实例目录**：`%APPDATA%` 即 `C:\Users\<你的用户名>\AppData\Roaming`。`MaiBotOneKeyDesktop` 下每个子文件夹是一个实例（名字是一串实例 ID，例如 `0f4edb67bb15`），可能有多个。用这几个办法确认是哪一个：
+
+1. 看修改时间：正在运行的那个实例，其 `modules\MaiBot\data`、`logs` 目录的时间戳是最近的；
+2. 看 `modules\MaiBot\resource.lock`（若存在）：里面的 `path` 就是该实例的运行目录，`installRoot` 是安装目录，两者不同；
+3. 直接看哪个实例的 `modules\MaiBot\plugins\` 下已经有你装过的其他插件。
+
+> 提示：在 WebUI 的插件管理里看某个已装插件的路径，是最快的确认方式。
+
+因为运行目录在用户数据区，**重装或升级 OneKey 安装目录不会带走你的插件**，但也意味着你在安装目录里改的插件文件与正在运行的插件无关。
 
 依赖已在 `_manifest.json` 中声明：
 
@@ -51,6 +79,19 @@
 如果使用 MaiBot OneKey 自带 Python：
 
     "d:\maibot\MaiBot OneKey\resources\runtime\python\python.exe" -m pip install jmcomic pillow pypdf -U
+
+---
+
+## 兼容性
+
+本插件的兼容性结论区分“本机实测”与“上游要求”，两者不是同一件事：
+
+- **本机 MaiBot OneKey 运行环境实测**：MaiBot v1.0.0-rc.4，maibot-plugin-sdk 2.5.2 —— 插件加载、`create_plugin`、6 个组件、配置模型（`[plugin]`/`[jm]`/`[send]`/`[privacy]`，`plugin.config_version=1.0.0`）与生命周期契约（`on_load`/`on_unload`/`on_config_update`）全部通过。
+- **隔离审计实测**：maibot-plugin-sdk 2.20.0 与 2.21.0 下，导入、`create_plugin`、组件与配置契约均通过（该项由隔离环境审计得出，不是本机运行时的版本）。
+- **上游要求**：MaiBot v1.3.19 需要 Python >= 3.12 与 maibot-plugin-sdk >= 2.20.0；本插件 `_manifest.json` 声明的 SDK 区间为 2.0.0–2.99.99，覆盖该要求（上游要求不等同于本机实测版本）。
+- **运行环境**：Python >= 3.12（随 MaiBot v1.3.19 要求）。
+
+> 插件版本号以 `_manifest.json` 的 `version` 字段为准；`[plugin].config_version` 是配置结构版本号，两者含义不同，不是同一个数字。
 
 ---
 
@@ -71,11 +112,13 @@
     temp_dir = "data/temp"
     max_search_results = 5
     preview_image_count = 5
+    max_concurrent_jobs = 2
 
 - `option_file`：自定义 JMComic `option.yml` 路径。留空时插件自动生成最小配置。
 - `temp_dir`：临时目录，只用于下载、生成 PDF、准备验车图。
 - `max_search_results`：搜索结果最多返回数量。
 - `preview_image_count`：验车发送前几张图片，默认 5。
+- `max_concurrent_jobs`：同时执行的下载/验车任务数量上限，默认 2，范围 1-8，越界值会被自动收敛到 1-8。等待队列上限为 `2 × max_concurrent_jobs`，超出后不再排队，而是立即回复“JMComic 当前任务较多，请稍后再试。”。该项为本版本新增，旧 `config.toml` 未填写时使用默认值 2。
 
 ### 发送设置
 
@@ -130,7 +173,7 @@
 
 1. 在 WebUI 修改 `config.toml` 或插件配置。
 2. 保存配置。
-3. MaiBot 触发配置更新后，插件会重新读取临时目录、搜索数量、验车张数、PDF 质量和白名单配置。
+3. MaiBot 触发配置更新后，插件会重新读取临时目录、搜索数量、验车张数、PDF 质量、并发上限和白名单配置。
 4. 不需要重启 MaiBot 主程序。
 
 ---
@@ -140,8 +183,8 @@
     maibot-jmcomic/
     ├── _manifest.json          # 插件元数据清单（manifest v2）
     ├── plugin.py               # 插件主入口（配置模型 + Tool + Command）
-    ├── config.example.toml     # 配置模板文件
-    ├── config.toml             # 用户配置文件
+    ├── config.example.toml     # 随插件发布
+    ├── config.toml             # 由 Runner 首次加载时从配置模型生成，.gitignore 忽略
     ├── .gitignore              # Git 忽略规则
     ├── README.md               # 使用说明
     └── _locales/
@@ -193,7 +236,7 @@
 2. PDF 发送和合并转发依赖 NapCat 适配器 API。
 3. 如果 JMComic 无法访问站点，请配置自定义 `option.yml` 并在 `option_file` 填写路径。
 4. 插件不会保留本子下载结果；图片和 PDF 都会在发送流程结束后清理。
-5. 插件启动阶段只初始化路径和目录；`jmcomic`、`Pillow` 与 `pypdf` 在实际命令执行时才导入，避免加载阶段卡住。
+5. 插件启动阶段只初始化路径和目录，并顺带清理上次异常退出残留的 `JM*` 任务目录与 PDF（进行中任务的目录和文件会被保留）；`jmcomic`、`Pillow` 与 `pypdf` 在实际命令执行时才导入，避免加载阶段卡住。
 
 ---
 

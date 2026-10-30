@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import random
 import re
 import shutil
@@ -21,6 +22,11 @@ from typing import Any, List, Optional, Tuple
 
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ActivationType, ToolParameterInfo, ToolParamType
+
+
+# 残留临时任务目录/文件名的匹配规则：只清理插件自己生成的任务产物。
+_JOB_DIR_NAME_RE = re.compile(r"JM\d+")
+_JOB_PDF_NAME_RE = re.compile(r"JM\d+.*\.pdf")
 
 
 # ── 配置模型 ──────────────────────────────────────────────
@@ -44,6 +50,7 @@ class JmConfig(PluginConfigBase):
     temp_dir: str = Field(default="data/temp", description="临时工作目录，下载、PDF、验车图片会在发送后清理")
     max_search_results: int = Field(default=5, description="JM搜索最多返回数量")
     preview_image_count: int = Field(default=5, description="JM验车发送前几张图片")
+    max_concurrent_jobs: int = Field(default=2, description="同时执行的下载/验车任务数量上限，范围 1-8")
 
 
 class SendConfig(PluginConfigBase):
@@ -83,6 +90,9 @@ class JMComicPlugin(MaiBotPlugin):
         self._plugin_dir = Path(__file__).resolve().parent
         self._data_dir = self._plugin_dir / "data"
         self._temp_dir = self._resolve_path(self.config.jm.temp_dir)
+        self._pending_job_tasks = getattr(self, "_pending_job_tasks", 0)
+        self._active_job_paths = getattr(self, "_active_job_paths", set())
+        self._refresh_job_limit()
         self._prepare_dirs()
         self.ctx.logger.info("[JMComicPlugin] 插件已加载，临时目录: %s", self._temp_dir)
 
@@ -91,6 +101,7 @@ class JMComicPlugin(MaiBotPlugin):
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         self._temp_dir = self._resolve_path(self.config.jm.temp_dir)
+        self._refresh_job_limit()
         self._prepare_dirs()
         self.ctx.logger.info(
             "[JMComicPlugin] 配置已热重载: scope=%s, version=%s, temp_dir=%s, users=%d, groups=%d",
@@ -101,9 +112,114 @@ class JMComicPlugin(MaiBotPlugin):
             len(self.config.privacy.allowed_groups),
         )
 
+    def _job_limit(self) -> int:
+        """返回配置中的并发任务上限，越界值收敛到 1-8。"""
+        return max(1, min(int(self.config.jm.max_concurrent_jobs), 8))
+
+    def _refresh_job_limit(self) -> int:
+        """重新计算并发上限，必要时重建信号量。
+
+        这里通过类方法调用 `_job_limit`：`self._job_limit` 在刷新后会保存为 int，
+        直接写 `self._job_limit = self._job_limit()` 会在同一实例上重复进入
+        on_load 时抛出 TypeError（'int' object is not callable）。
+        """
+        limit = type(self)._job_limit(self)
+        if not isinstance(getattr(self, "_job_limit", None), int) or self._job_limit != limit:
+            self._job_semaphore = asyncio.Semaphore(limit)
+        self._job_limit = limit
+        return limit
+
+    def _job_queue_capacity(self) -> int:
+        """排队上限：运行中加等待中的任务总量不超过 2 倍并发上限。"""
+        limit = getattr(self, "_job_limit", None)
+        if not isinstance(limit, int):
+            limit = type(self)._job_limit(self)
+        return max(1, 2 * limit)
+
+    @contextlib.asynccontextmanager
+    async def _job_slot(self):
+        """占用一个并发槽位；任务结束、抛错或被取消时都会归还。"""
+        semaphore = self._job_semaphore
+        await semaphore.acquire()
+        try:
+            yield
+        finally:
+            semaphore.release()
+
+    def _spawn_job(self, factory) -> bool:
+        """在队列容量内启动后台任务；容量已满时返回 False 且不创建协程。"""
+        pending = int(getattr(self, "_pending_job_tasks", 0))
+        if pending >= self._job_queue_capacity():
+            return False
+        self._pending_job_tasks = pending + 1
+        try:
+            job = factory()
+        except BaseException:
+            self._pending_job_tasks = pending
+            raise
+        asyncio.create_task(self._run_job(job))
+        return True
+
+    async def _run_job(self, job) -> None:
+        """等待后台任务结束，并归还队列计数。"""
+        try:
+            await job
+        finally:
+            self._pending_job_tasks = max(0, int(getattr(self, "_pending_job_tasks", 1)) - 1)
+
+    def _register_job_path(self, path: Path) -> None:
+        """登记进行中任务占用的路径，避免被残留清理误删。"""
+        registry = getattr(self, "_active_job_paths", None)
+        if registry is None:
+            registry = set()
+            self._active_job_paths = registry
+        registry.add(str(path.resolve()))
+
+    def _release_job_path(self, path: Path) -> None:
+        """释放进行中任务占用的路径登记。"""
+        registry = getattr(self, "_active_job_paths", None)
+        if registry is None:
+            return
+        registry.discard(str(path.resolve()))
+
     def _prepare_dirs(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._temp_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_stale_temp_jobs()
+
+    def _cleanup_stale_temp_jobs(self) -> None:
+        """清理上次异常退出遗留的 JM 任务目录与 PDF，跳过进行中任务占用的路径。"""
+        registry = getattr(self, "_active_job_paths", set())
+        try:
+            entries = sorted(self._temp_dir.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            self.ctx.logger.warning("[JMComicPlugin] 读取临时目录失败，跳过残留清理: %s", exc)
+            return
+
+        removed = 0
+        for entry in entries:
+            name = entry.name
+            is_job_dir = entry.is_dir() and _JOB_DIR_NAME_RE.fullmatch(name) is not None
+            is_job_file = entry.is_file() and _JOB_PDF_NAME_RE.fullmatch(name) is not None
+            if not (is_job_dir or is_job_file):
+                continue
+            try:
+                if str(entry.resolve()) in registry:
+                    continue
+            except OSError as exc:
+                self.ctx.logger.warning("[JMComicPlugin] 解析临时路径失败，跳过 %s: %s", entry, exc)
+                continue
+            try:
+                if is_job_dir:
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+                removed += 1
+            except OSError as exc:
+                self.ctx.logger.warning("[JMComicPlugin] 清理残留临时文件失败 %s: %s", entry, exc)
+
+        if removed:
+            self.ctx.logger.info("[JMComicPlugin] 已清理 %d 个残留临时任务目录/文件", removed)
 
     def _resolve_path(self, value: str) -> Path:
         path = Path(value).expanduser()
@@ -211,6 +327,7 @@ class JMComicPlugin(MaiBotPlugin):
         if album_dir.exists():
             shutil.rmtree(album_dir, ignore_errors=True)
         album_dir.mkdir(parents=True, exist_ok=True)
+        self._register_job_path(album_dir)
 
         jmcomic = self._get_jm_module()
         option = self._create_option(album_dir)
@@ -301,30 +418,50 @@ class JMComicPlugin(MaiBotPlugin):
             from PIL import Image  # type: ignore
         except ImportError as exc:
             raise RuntimeError("未安装 Pillow，无法生成 PDF。请执行: pip install pillow -U") from exc
+        try:
+            from pypdf import PdfReader, PdfWriter  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("未安装 pypdf，无法加密 PDF。请执行: pip install pypdf -U") from exc
 
         album_dir, title, images = self._download_album_to_temp_sync(album_id)
         pdf_path = self._temp_dir / f"JM{album_id}_{self._safe_filename(title)}.pdf"
         if pdf_path.exists():
             pdf_path.unlink()
 
-        converted = []
-        for image_path in images:
-            with Image.open(image_path) as image:
-                if image.mode in ("RGBA", "P"):
-                    image = image.convert("RGB")
-                else:
-                    image = image.copy().convert("RGB")
-                converted.append(image)
-
-        if not converted:
+        if not images:
             raise RuntimeError(f"JM{album_id} 没有可转换为 PDF 的图片。")
 
         quality = max(1, min(int(self.config.send.pdf_quality), 95))
-        first, rest = converted[0], converted[1:]
-        first.save(pdf_path, "PDF", save_all=True, append_images=rest, quality=quality)
-        for image in converted:
-            image.close()
-        encrypted_path = self._encrypt_pdf_sync(pdf_path, album_id)
+
+        # 逐页编码：任意时刻只保留当前页的原图与其 RGB 转换结果，
+        # 峰值内存不再随总页数线性增长，页序与页数保持不变。
+        page_dir = album_dir / "_pages"
+        page_dir.mkdir(parents=True, exist_ok=True)
+        page_files: List[Path] = []
+        for index, image_path in enumerate(images):
+            page_file = page_dir / f"{index:05d}.pdf"
+            with Image.open(image_path) as image:
+                converted = image.convert("RGB")
+                try:
+                    converted.save(page_file, "PDF", quality=quality)
+                finally:
+                    converted.close()
+            page_files.append(page_file)
+
+        writer = PdfWriter()
+        for page_file in page_files:
+            with PdfReader(str(page_file)) as reader:
+                writer.add_page(reader.pages[0])
+
+        with pdf_path.open("wb") as file:
+            writer.write(file)
+
+        self._register_job_path(pdf_path)
+        try:
+            encrypted_path = self._encrypt_pdf_sync(pdf_path, album_id)
+        finally:
+            self._release_job_path(pdf_path)
+        self._register_job_path(encrypted_path)
         return encrypted_path, album_dir
 
     def _preview_images_sync(self, album_id: str) -> Tuple[Path, str, List[Path]]:
@@ -541,40 +678,49 @@ class JMComicPlugin(MaiBotPlugin):
         album_dir: Optional[Path] = None
         pdf_path: Optional[Path] = None
         try:
-            if self.config.send.notice_before_download:
-                await self._send_recallable_text(f"收到，正在下载 JM{album_id} 并转换为 PDF。", stream_id, group_id, user_id)
-            pdf_path, album_dir = await self._run_blocking(self._convert_images_to_pdf_sync, album_id)
-            await self._send_pdf_file(pdf_path, stream_id, group_id, user_id)
-            await self._send_recallable_text(f"JM{album_id} 加密 PDF 已发送完成，打开密码为：{album_id}", stream_id, group_id, user_id)
+            async with self._job_slot():
+                if self.config.send.notice_before_download:
+                    await self._send_recallable_text(f"收到，正在下载 JM{album_id} 并转换为 PDF。", stream_id, group_id, user_id)
+                pdf_path, album_dir = await self._run_blocking(self._convert_images_to_pdf_sync, album_id)
+                await self._send_pdf_file(pdf_path, stream_id, group_id, user_id)
+                await self._send_recallable_text(f"JM{album_id} 加密 PDF 已发送完成，打开密码为：{album_id}", stream_id, group_id, user_id)
         except Exception as exc:
             self.ctx.logger.error("[JMComicPlugin] PDF 发送失败: %s", exc, exc_info=True)
             await self._send_recallable_text(f"JM{album_id} 下载或发送失败，请稍后重试。", stream_id, group_id, user_id)
         finally:
             if album_dir:
+                self._release_job_path(album_dir)
                 shutil.rmtree(album_dir, ignore_errors=True)
-            if pdf_path and pdf_path.exists():
-                pdf_path.unlink(missing_ok=True)
+            if pdf_path:
+                self._release_job_path(pdf_path)
+                if pdf_path.exists():
+                    pdf_path.unlink(missing_ok=True)
 
-    async def _preview_and_send(self, album_id: str, stream_id: str, group_id: str = "", user_id: str = "") -> None:
+    async def _preview_and_send(self, album_id: str, stream_id: str, group_id: str = "", user_id: str = "", _acquire_slot: bool = True) -> None:
         album_dir: Optional[Path] = None
         try:
-            if self.config.send.notice_before_download:
-                await self._send_recallable_text(f"收到，正在准备 JM{album_id} 验车图。", stream_id, group_id, user_id)
-            album_dir, info_text, images = await self._run_blocking(self._preview_images_sync, album_id)
-            await self._send_forward_images(album_id, info_text, images, stream_id, group_id, user_id)
+            async with contextlib.AsyncExitStack() as stack:
+                if _acquire_slot:
+                    await stack.enter_async_context(self._job_slot())
+                if self.config.send.notice_before_download:
+                    await self._send_recallable_text(f"收到，正在准备 JM{album_id} 验车图。", stream_id, group_id, user_id)
+                album_dir, info_text, images = await self._run_blocking(self._preview_images_sync, album_id)
+                await self._send_forward_images(album_id, info_text, images, stream_id, group_id, user_id)
         except Exception as exc:
             self.ctx.logger.error("[JMComicPlugin] 验车失败: %s", exc, exc_info=True)
             await self._send_recallable_text(f"JM{album_id} 验车失败，请稍后重试。", stream_id, group_id, user_id)
         finally:
             if album_dir:
+                self._release_job_path(album_dir)
                 shutil.rmtree(album_dir, ignore_errors=True)
 
     async def _random_preview_and_send(self, stream_id: str, group_id: str = "", user_id: str = "") -> None:
         try:
-            if self.config.send.notice_before_download:
-                await self._send_recallable_text("收到，正在随机抽取本子并准备验车图。", stream_id, group_id, user_id)
-            album_id = await self._run_blocking(self._random_album_id_sync)
-            await self._preview_and_send(album_id, stream_id, group_id, user_id)
+            async with self._job_slot():
+                if self.config.send.notice_before_download:
+                    await self._send_recallable_text("收到，正在随机抽取本子并准备验车图。", stream_id, group_id, user_id)
+                album_id = await self._run_blocking(self._random_album_id_sync)
+                await self._preview_and_send(album_id, stream_id, group_id, user_id, _acquire_slot=False)
         except Exception as exc:
             self.ctx.logger.error("[JMComicPlugin] 随机本子失败: %s", exc, exc_info=True)
             await self._send_recallable_text("随机本子失败，请稍后重试。", stream_id, group_id, user_id)
@@ -620,14 +766,15 @@ class JMComicPlugin(MaiBotPlugin):
         allowed, reason = self._is_allowed(group, user)
         if not allowed:
             return {"name": "jm_download_pdf", "content": reason}
-        asyncio.create_task(
-            self._download_pdf_and_send(
+        if not self._spawn_job(
+            lambda: self._download_pdf_and_send(
                 real_id,
                 stream_id,
                 group_id=group,
                 user_id=user,
             )
-        )
+        ):
+            return {"name": "jm_download_pdf", "content": "JMComic 当前任务较多，请稍后再试。"}
         return {"name": "jm_download_pdf", "content": f"已开始处理 JM{real_id}，完成后会通过 QQ 文件发送 PDF。"}
 
     # ── Tool: 验车合并转发 ─────────────────────────────────
@@ -660,14 +807,15 @@ class JMComicPlugin(MaiBotPlugin):
         allowed, reason = self._is_allowed(group, user)
         if not allowed:
             return {"name": "jm_preview_forward", "content": reason}
-        asyncio.create_task(
-            self._preview_and_send(
+        if not self._spawn_job(
+            lambda: self._preview_and_send(
                 real_id,
                 stream_id,
                 group_id=group,
                 user_id=user,
             )
-        )
+        ):
+            return {"name": "jm_preview_forward", "content": "JMComic 当前任务较多，请稍后再试。"}
         return {"name": "jm_preview_forward", "content": f"已开始准备 JM{real_id} 的验车合并转发消息。"}
 
     # ── Tool: 搜索 ─────────────────────────────────────────
@@ -722,7 +870,8 @@ class JMComicPlugin(MaiBotPlugin):
         allowed, reason = self._is_allowed(group, user)
         if not allowed:
             return {"name": "jm_random_preview", "content": reason}
-        asyncio.create_task(self._random_preview_and_send(stream_id, group, user))
+        if not self._spawn_job(lambda: self._random_preview_and_send(stream_id, group, user)):
+            return {"name": "jm_random_preview", "content": "JMComic 当前任务较多，请稍后再试。"}
         return {"name": "jm_random_preview", "content": "已开始随机抽取本子，稍后会按 JM验车 形式发送预览。"}
 
     # ── Commands ──────────────────────────────────────────
@@ -772,7 +921,9 @@ class JMComicPlugin(MaiBotPlugin):
                 return True, "ID 错误", True
             if not await self._check_permission_or_reply(stream_id, group, user):
                 return True, "白名单拒绝", True
-            asyncio.create_task(self._download_pdf_and_send(album_id, stream_id, group_id=group, user_id=user))
+            if not self._spawn_job(lambda: self._download_pdf_and_send(album_id, stream_id, group_id=group, user_id=user)):
+                await self._send_recallable_text("JMComic 当前任务较多，请稍后再试。", stream_id)
+                return True, "任务队列已满", True
             return True, f"已开始处理 JM{album_id}", True
 
         if body.startswith("验车"):
@@ -782,7 +933,9 @@ class JMComicPlugin(MaiBotPlugin):
                 return True, "ID 错误", True
             if not await self._check_permission_or_reply(stream_id, group, user):
                 return True, "白名单拒绝", True
-            asyncio.create_task(self._preview_and_send(album_id, stream_id, group_id=group, user_id=user))
+            if not self._spawn_job(lambda: self._preview_and_send(album_id, stream_id, group_id=group, user_id=user)):
+                await self._send_recallable_text("JMComic 当前任务较多，请稍后再试。", stream_id)
+                return True, "任务队列已满", True
             return True, f"已开始验车 JM{album_id}", True
 
         await self.ctx.send.text(self._help_text(), stream_id)
@@ -798,7 +951,9 @@ class JMComicPlugin(MaiBotPlugin):
         user = str(kwargs.get("user_id", ""))
         if not await self._check_permission_or_reply(stream_id, group, user):
             return True, "白名单拒绝", True
-        asyncio.create_task(self._random_preview_and_send(stream_id, group, user))
+        if not self._spawn_job(lambda: self._random_preview_and_send(stream_id, group, user)):
+            await self._send_recallable_text("JMComic 当前任务较多，请稍后再试。", stream_id)
+            return True, "任务队列已满", True
         return True, "已开始随机本子", True
 
 

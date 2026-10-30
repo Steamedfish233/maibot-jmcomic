@@ -20,6 +20,11 @@ max_search_results = 5
 # JM验车发送前几张图片，默认 5 张。
 preview_image_count = 5
 
+# 同时执行的下载/验车任务数量上限，范围 1-8，默认 2。
+# 超过上限的请求不会排队执行，而是立即回复“JMComic 当前任务较多，请稍后再试。”。
+# 填写越界数值时会自动收敛到 1-8。
+max_concurrent_jobs = 2
+
 [send]
 # 下载/验车前是否发送“正在处理”的提示。
 notice_before_download = true
