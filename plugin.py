@@ -17,6 +17,7 @@ import contextlib
 import random
 import re
 import shutil
+import threading
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -182,6 +183,19 @@ class JMComicPlugin(MaiBotPlugin):
             return
         registry.discard(str(path.resolve()))
 
+    def _release_album_job_paths(self, album_id: str) -> None:
+        """按作品号整体归还该任务的登记：任务目录及其派生出的产物。
+
+        只匹配 `JM123` 本身或以 `JM123_` 开头的条目，因此 `JM123` 不会误伤 `JM1234`。
+        取消/异常时调用方可能拿不到具体路径，靠名字回收可以避免残留登记
+        让临时文件永远无法被清理。
+        """
+        stem = f"JM{album_id}"
+        for path in list(getattr(self, "_active_job_paths", ())):
+            name = Path(path).name
+            if name == stem or name.startswith(stem + "_"):
+                self._release_job_path(Path(path))
+
     def _prepare_dirs(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._temp_dir.mkdir(parents=True, exist_ok=True)
@@ -323,22 +337,30 @@ class JMComicPlugin(MaiBotPlugin):
         )
 
     def _download_album_to_temp_sync(self, album_id: str) -> Tuple[Path, str, List[Path]]:
-        album_dir = self._temp_dir / f"JM{album_id}"
-        if album_dir.exists():
-            shutil.rmtree(album_dir, ignore_errors=True)
-        album_dir.mkdir(parents=True, exist_ok=True)
+        album_dir = self._album_job_dir(album_id)
+        # 先登记再删除/创建：残留清理按目录名匹配，只有提前登记才能保证
+        # 正在准备的任务目录在创建瞬间就已经受保护。
         self._register_job_path(album_dir)
+        try:
+            if album_dir.exists():
+                shutil.rmtree(album_dir, ignore_errors=True)
+            album_dir.mkdir(parents=True, exist_ok=True)
 
-        jmcomic = self._get_jm_module()
-        option = self._create_option(album_dir)
-        jmcomic.download_album(album_id, option)
+            jmcomic = self._get_jm_module()
+            option = self._create_option(album_dir)
+            jmcomic.download_album(album_id, option)
 
-        images = self._find_images(album_dir)
-        if not images:
-            raise RuntimeError(f"JM{album_id} 下载完成，但没有找到图片文件。")
+            images = self._find_images(album_dir)
+            if not images:
+                raise RuntimeError(f"JM{album_id} 下载完成，但没有找到图片文件。")
 
-        title = self._get_album_title_sync(album_id)
-        return album_dir, title, images
+            title = self._get_album_title_sync(album_id)
+            return album_dir, title, images
+        except BaseException:
+            # 下载失败或被取消：归还登记，让残留目录能在后续清理中被回收。
+            # 成功路径保持登记不变，仍由调用方的 finally 释放（discard 幂等）。
+            self._release_job_path(album_dir)
+            raise
 
     def _get_album_title_sync(self, album_id: str) -> str:
         try:
@@ -391,8 +413,20 @@ class JMComicPlugin(MaiBotPlugin):
                 continue
         raise RuntimeError("随机本子获取失败，请稍后重试。")
 
+    def _album_job_dir(self, album_id: str) -> Path:
+        """返回某个作品的任务目录路径（命名规则只在这里定义一次）。"""
+        return self._temp_dir / f"JM{album_id}"
+
+    def _encrypted_pdf_path(self, pdf_path: Path) -> Path:
+        """返回加密产物的路径。
+
+        明文 PDF 与加密 PDF 的命名规则只在这里定义一次，避免“登记路径”与
+        “实际写出的路径”发生漂移（登记必须早于产物创建）。
+        """
+        return pdf_path.with_name(pdf_path.stem + "_加密.pdf")
+
     def _encrypt_pdf_sync(self, source_path: Path, password: str) -> Path:
-        encrypted_path = source_path.with_name(source_path.stem + "_加密.pdf")
+        encrypted_path = self._encrypted_pdf_path(source_path)
         try:
             from pypdf import PdfReader, PdfWriter  # type: ignore
 
@@ -453,22 +487,66 @@ class JMComicPlugin(MaiBotPlugin):
             with PdfReader(str(page_file)) as reader:
                 writer.add_page(reader.pages[0])
 
-        with pdf_path.open("wb") as file:
-            writer.write(file)
-
+        # 登记必须发生在产物落盘之前：热重载会触发 _cleanup_stale_temp_jobs，
+        # 只有先登记，写入中/加密中的半成品才不会被误删。
+        # 加密产物名与 _encrypt_pdf_sync 共用同一个命名函数，避免登记路径漂移。
+        encrypted_path = self._encrypted_pdf_path(pdf_path)
         self._register_job_path(pdf_path)
-        try:
-            encrypted_path = self._encrypt_pdf_sync(pdf_path, album_id)
-        finally:
-            self._release_job_path(pdf_path)
         self._register_job_path(encrypted_path)
-        return encrypted_path, album_dir
+        try:
+            with pdf_path.open("wb") as file:
+                writer.write(file)
+            self._encrypt_pdf_sync(pdf_path, album_id)
+            return encrypted_path, album_dir
+        except BaseException:
+            # 失败：归还本任务的登记，避免残留登记让后续清理永远跳过这些文件。
+            self._release_album_job_paths(album_id)
+            raise
+        finally:
+            # 明文 PDF 已被 _encrypt_pdf_sync 删除（成功或失败都会删除），登记到此为止；
+            # 加密产物与任务目录继续保持登记，由调用方按需释放（见 _build_pdf_job_sync）。
+            self._release_job_path(pdf_path)
 
     def _preview_images_sync(self, album_id: str) -> Tuple[Path, str, List[Path]]:
         album_dir, title, images = self._download_album_to_temp_sync(album_id)
         count = max(1, int(self.config.jm.preview_image_count))
         info_text = self._get_album_info_text_sync(album_id, title, len(images))
         return album_dir, info_text, images[:count]
+
+    def _build_pdf_job_sync(self, album_id: str, job_abandoned: threading.Event) -> Tuple[Path, Path]:
+        """在后台线程中构建 PDF。
+
+        取消发生在 await 处，调用方的 finally 会早于构建结束运行、拿不到结果，
+        因此调用方已放弃任务时，由本线程在退出前自行归还登记。
+
+        Args:
+            album_id: 作品号。
+            job_abandoned: 调用方放弃任务的信号。
+
+        Returns:
+            Tuple[Path, Path]: 加密 PDF 路径与任务目录。
+        """
+        try:
+            return self._convert_images_to_pdf_sync(album_id)
+        finally:
+            if job_abandoned.is_set():
+                self._release_album_job_paths(album_id)
+
+    def _build_preview_job_sync(self, album_id: str, job_abandoned: threading.Event) -> Tuple[Path, str, List[Path]]:
+        """在后台线程中准备验车图；调用方被取消时由本线程归还登记。
+
+        Args:
+            album_id: 作品号。
+            job_abandoned: 调用方放弃任务的信号。
+
+        Returns:
+            Tuple[Path, str, List[Path]]: 任务目录、作品信息与前几张图片。
+        """
+        try:
+            return self._preview_images_sync(album_id)
+        finally:
+            if job_abandoned.is_set():
+                self._release_album_job_paths(album_id)
 
     def _search_sync(self, keyword: str) -> List[dict]:
         option = self._create_option()
@@ -677,41 +755,47 @@ class JMComicPlugin(MaiBotPlugin):
     async def _download_pdf_and_send(self, album_id: str, stream_id: str, group_id: str = "", user_id: str = "") -> None:
         album_dir: Optional[Path] = None
         pdf_path: Optional[Path] = None
+        # 后台线程的“调用方已放弃”信号：取消时由线程自行归还它登记过的路径。
+        job_abandoned = threading.Event()
         try:
             async with self._job_slot():
                 if self.config.send.notice_before_download:
                     await self._send_recallable_text(f"收到，正在下载 JM{album_id} 并转换为 PDF。", stream_id, group_id, user_id)
-                pdf_path, album_dir = await self._run_blocking(self._convert_images_to_pdf_sync, album_id)
+                pdf_path, album_dir = await self._run_blocking(self._build_pdf_job_sync, album_id, job_abandoned)
                 await self._send_pdf_file(pdf_path, stream_id, group_id, user_id)
                 await self._send_recallable_text(f"JM{album_id} 加密 PDF 已发送完成，打开密码为：{album_id}", stream_id, group_id, user_id)
         except Exception as exc:
             self.ctx.logger.error("[JMComicPlugin] PDF 发送失败: %s", exc, exc_info=True)
             await self._send_recallable_text(f"JM{album_id} 下载或发送失败，请稍后重试。", stream_id, group_id, user_id)
         finally:
+            # 先置位“已放弃”：仍在后台线程中运行的构建会据此在退出前自行归还登记。
+            job_abandoned.set()
+            # 按作品号整体归还（任务目录 + JM<id>_*.pdf），取消时拿不到具体路径也能兜底。
+            self._release_album_job_paths(album_id)
             if album_dir:
-                self._release_job_path(album_dir)
                 shutil.rmtree(album_dir, ignore_errors=True)
-            if pdf_path:
-                self._release_job_path(pdf_path)
-                if pdf_path.exists():
-                    pdf_path.unlink(missing_ok=True)
+            if pdf_path and pdf_path.exists():
+                pdf_path.unlink(missing_ok=True)
 
     async def _preview_and_send(self, album_id: str, stream_id: str, group_id: str = "", user_id: str = "", _acquire_slot: bool = True) -> None:
         album_dir: Optional[Path] = None
+        job_abandoned = threading.Event()
         try:
             async with contextlib.AsyncExitStack() as stack:
                 if _acquire_slot:
                     await stack.enter_async_context(self._job_slot())
                 if self.config.send.notice_before_download:
                     await self._send_recallable_text(f"收到，正在准备 JM{album_id} 验车图。", stream_id, group_id, user_id)
-                album_dir, info_text, images = await self._run_blocking(self._preview_images_sync, album_id)
+                album_dir, info_text, images = await self._run_blocking(self._build_preview_job_sync, album_id, job_abandoned)
                 await self._send_forward_images(album_id, info_text, images, stream_id, group_id, user_id)
         except Exception as exc:
             self.ctx.logger.error("[JMComicPlugin] 验车失败: %s", exc, exc_info=True)
             await self._send_recallable_text(f"JM{album_id} 验车失败，请稍后重试。", stream_id, group_id, user_id)
         finally:
+            # 同 _download_pdf_and_send：置位放弃信号并按作品号整体归还登记。
+            job_abandoned.set()
+            self._release_album_job_paths(album_id)
             if album_dir:
-                self._release_job_path(album_dir)
                 shutil.rmtree(album_dir, ignore_errors=True)
 
     async def _random_preview_and_send(self, stream_id: str, group_id: str = "", user_id: str = "") -> None:

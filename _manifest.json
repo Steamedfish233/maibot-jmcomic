@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "local.maibot-jmcomic",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "name": "JMComic 助手",
   "description": "基于 jmcomic 的 MaiBot 第三方插件，支持 JM下载加密 PDF 发送、JM验车合并转发、JM搜索、随机本子。",
   "author": {
